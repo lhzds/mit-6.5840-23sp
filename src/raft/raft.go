@@ -326,11 +326,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.stateLock.Lock()
 
 	if args.Term < rf.currentTerm {
-		rf.stateLock.Unlock()
-
-		Debug(dAlive, "[S%v -> S%v] S%v receive expired heartbeat", args.LeaderId, rf.me, rf.me)
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		rf.stateLock.Unlock()
+		Debug(dAlive, "[S%v -> S%v] S%v receive expired heartbeat", args.LeaderId, rf.me, rf.me)
 		return
 	}
 
