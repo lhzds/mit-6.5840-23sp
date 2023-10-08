@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -27,7 +29,7 @@ func TestInitialElection2A(t *testing.T) {
 	cfg.begin("Test (2A): initial election")
 
 	// is a leader elected?
-	cfg.checkOneLeader()
+	leader1 := cfg.checkOneLeader()
 
 	// sleep a bit to avoid racing with followers learning of the
 	// election, then check that all peers agree on the term.
@@ -45,7 +47,10 @@ func TestInitialElection2A(t *testing.T) {
 	}
 
 	// there should still be a leader.
-	cfg.checkOneLeader()
+	leader2 := cfg.checkOneLeader()
+	if leader1 != leader2 {
+		t.Fatalf("leader changed even though there were no failures")
+	}
 
 	cfg.end()
 }

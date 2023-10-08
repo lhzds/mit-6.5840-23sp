@@ -52,10 +52,23 @@ type ApplyMsg struct {
 type RaftState int
 
 const (
-	Leader RaftState = iota
-	Follower
+	Follower RaftState = iota
 	Candidate
+	Leader
 )
+
+func (s RaftState) String() string {
+	switch s {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	default:
+		return "Unknown"
+	}
+}
 
 type LogEntry struct {
 	Term int
@@ -132,9 +145,15 @@ func (rf *Raft) nextState(state RaftState, term int, holdLock bool) {
 	case 0:
 		// do nothing
 	default:
+		if rf.currentTerm != term {
+			Debug(dTerm, "[S%v's Term: %v -> %v] S%v's term changed", rf.me, rf.currentTerm, term, rf.me)
+		}
 		rf.currentTerm = term
 	}
 
+	if state != rf.state {
+		Debug(dState, "[S%v's State: %s -> %s] S%v's state changed", rf.me, rf.state, state, rf.me)
+	}
 	switch state {
 	case Leader:
 		rf.state = Leader
@@ -222,6 +241,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.stateLock.Unlock()
 
 	if args.Term < rf.currentTerm {
+		Debug(dVote, "[S%v -> S%v]S%v receive a expired RequestVote", args.CandidateId, rf.me, rf.me)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -246,11 +266,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// 如果本轮已经投过票，且票不是投给自己（先来先到原则）
 	if rf.voteFor != -1 && args.CandidateId != rf.voteFor {
+		Debug(dVote, "[S%v -> S%v] S%v refuses to vote due to having voted for other",
+			args.CandidateId, rf.me, rf.me)
 		reply.VoteGranted = false
 		return
 	}
 
 	// 同意投票
+	Debug(dVote, "[S%v -> S%v] S%v argees to vote", args.CandidateId, rf.me, rf.me)
 	rf.voteFor = args.CandidateId
 	reply.VoteGranted = true
 }
@@ -311,6 +334,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.nextState(Follower, args.Term, true)
 	rf.stateLock.Unlock()
 
+	Debug(dAlive, "[S%v -> S%v] S%v receive heartbeat", args.LeaderId, rf.me, rf.me)
 	rf.setLastContact(time.Now())
 }
 
@@ -366,21 +390,8 @@ func (rf *Raft) quorumSize() int {
 	return (len(rf.peers) + 1) / 2
 }
 
-// 状态变为 Candidate，并发起一轮新的选举
-func (rf *Raft) asCandidateAndStartElection() {
-	// 初始化
-	rf.nextState(Candidate, -1, false)
-
-	// 从自己这获得一票
-	rf.setGrantedVotes(1)
-
-	// 向其他人寻求选票
-	rf.stateLock.Lock()
-	currentTerm := rf.currentTerm
-	me := rf.me
-	rf.stateLock.Unlock()
-	// lastLogIndex := len(rf.log)
-	// lastLogTerm := rf.log[lastLogIndex].term
+func (rf *Raft) startElection(currentTerm int) {
+	rf.setGrantedVotes(1) // 先给自己投一票
 
 	for server := 0; server < len(rf.peers); server++ {
 		if server == rf.me {
@@ -391,12 +402,13 @@ func (rf *Raft) asCandidateAndStartElection() {
 		go func() {
 			args := RequestVoteArgs{
 				Term:        currentTerm,
-				CandidateId: me,
+				CandidateId: rf.me,
 				// lastLogTerm:  lastLogTerm,
 				// lastLogIndex: lastLogIndex,
 			}
 			reply := RequestVoteReply{}
 
+			Debug(dVote, "[S%v -> S%v] S%v send a RequestVote", rf.me, server, rf.me)
 			if !rf.sendRequestVote(server, &args, &reply) {
 				return
 			}
@@ -414,17 +426,65 @@ func (rf *Raft) asCandidateAndStartElection() {
 			rf.stateLock.Unlock()
 
 			if reply.VoteGranted {
+				Debug(dVote, "[S%v <- S%v] S%v receive a vote", rf.me, server, rf.me)
 				rf.addGrantedVotes(1)
 			}
 		}()
 	}
 }
 
-// Leader 向所有 Follower 发送心跳信号
-func (rf *Raft) heartbeat() {
+func (rf *Raft) runFollower(contactLeader bool) {
 	rf.stateLock.Lock()
+	// 如果时限内没有收到心跳信息
+	if !contactLeader && rf.voteFor == -1 {
+		Debug(dTimer, "S%v time out, start election", rf.me)
+
+		rf.nextState(Candidate, -1, true)
+		currentTerm := rf.currentTerm
+		rf.stateLock.Unlock()
+		rf.startElection(currentTerm)
+		return
+	}
+	rf.stateLock.Unlock()
+}
+
+func (rf *Raft) runCandidate() {
+	// 可能接受了其他节点 Term 更高的信息而转变为 Follower，因此这里需检测状态是否已经发生改变
+	rf.stateLock.Lock()
+	if rf.state != Candidate {
+		rf.stateLock.Unlock()
+		return
+	}
+
+	if int(rf.getGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
+		Debug(dVote, "S%v receives votes from majority of servers", rf.me)
+		rf.nextState(Leader, 0, true)
+		rf.stateLock.Unlock()
+		return
+	}
+
+	//发起一轮新的选举
+	Debug(dTimer, "S%v time out, start a new election", rf.me)
+	rf.nextState(Candidate, -1, true)
 	currentTerm := rf.currentTerm
-	me := rf.me
+	rf.stateLock.Unlock()
+	// lastLogIndex := len(rf.log)
+	// lastLogTerm := rf.log[lastLogIndex].term
+
+	rf.startElection(currentTerm)
+}
+
+func (rf *Raft) runLeader() {
+	// 可能已经退位了
+	rf.stateLock.Lock()
+	if rf.state != Leader {
+		rf.stateLock.Unlock()
+		return
+	}
+
+	// 向所有 Follower 发送心跳信号
+	Debug(dTimer, "S%v send heartbeat to all servers", rf.me)
+	currentTerm := rf.currentTerm
 	rf.stateLock.Unlock()
 
 	for server := 0; server < len(rf.peers); server++ {
@@ -436,10 +496,11 @@ func (rf *Raft) heartbeat() {
 		go func() {
 			args := AppendEntriesArgs{
 				Term:     currentTerm,
-				LeaderId: me,
+				LeaderId: rf.me,
 			}
 			reply := AppendEntriesReply{}
 
+			Debug(dAlive, "[S%v -> S%v] S%v send heartbeat", rf.me, server, rf.me)
 			if !rf.SendAppendEntries(server, &args, &reply) {
 				return
 			}
@@ -457,31 +518,34 @@ func (rf *Raft) heartbeat() {
 func (rf *Raft) ticker() {
 	for !rf.killed() {
 		// Your code here (2A)
-		electionTimeout := time.Duration(100 + (rand.Int63() % 300))
+		electionTimeout := time.Duration(50 + (rand.Int63() % 300))
 
+		rf.stateLock.Lock()
 		switch rf.state {
 		case Follower:
-			time.Sleep(electionTimeout * time.Millisecond)
+			timeout := electionTimeout * time.Millisecond
+			Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
+			rf.stateLock.Unlock()
+			time.Sleep(timeout)
 
-			// 如果时限内没有收到心跳信息
-			if time.Since(rf.getLastContact()) >= electionTimeout {
-				rf.asCandidateAndStartElection()
-			}
+			rf.runFollower(time.Since(rf.getLastContact()) <= timeout)
 		case Candidate:
-			time.Sleep(electionTimeout * time.Millisecond)
+			timeout := electionTimeout * time.Millisecond
+			Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
+			rf.stateLock.Unlock()
+			time.Sleep(timeout)
 
-			if int(rf.getGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
-				rf.nextState(Leader, 0, false)
-			} else { // 重新开始新一轮的选举
-				rf.asCandidateAndStartElection()
-			}
-			// 如果这个产生了新 Leader，需要转变为 Follower，这个过程在 AppendEntries 的 handler 中处理
+			rf.runCandidate()
 		case Leader:
-			time.Sleep(electionTimeout * time.Millisecond / 5)
+			timeout := electionTimeout * time.Millisecond / 5
+			Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
+			rf.stateLock.Unlock()
+			time.Sleep(timeout)
 
-			rf.heartbeat()
+			rf.runLeader()
 		}
 	}
+	Debug(dState, "[dead] S%v is killed", rf.me)
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -501,8 +565,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.state = Follower
+	rf.voteFor = -1
 	rf.setLastContact(time.Time{})
-	rf.nextState(Follower, 0, true) // 初始化时未必要上锁，所以传入 true
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
