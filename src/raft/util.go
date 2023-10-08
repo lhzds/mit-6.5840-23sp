@@ -33,6 +33,7 @@ const (
 	dTimer logTopic = "TIMR" // 定时器触发
 	dVote  logTopic = "VOTE" // 投票消息
 	dAlive logTopic = "LIVE" // Leader 发送心跳 keep alive
+	dNet   logTopic = "NETW" // 网络分区情况
 )
 
 var debugStart time.Time

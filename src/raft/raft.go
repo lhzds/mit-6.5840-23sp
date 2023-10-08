@@ -92,7 +92,7 @@ type Raft struct {
 	log         []LogEntry
 
 	// Follower
-	lastContact atomic.Value // 上一次接受到 Leader 心跳信息的时间
+	lastContact atomic.Value // 上一次接受到 Leader 心跳信息或者成功投票给 Candidate 的时间
 
 	// Candidate
 	grantedVotes uint32 // 本轮收到的票数
@@ -275,6 +275,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 同意投票
 	Debug(dVote, "[S%v -> S%v] S%v argees to vote", args.CandidateId, rf.me, rf.me)
 	rf.voteFor = args.CandidateId
+	rf.setLastContact(time.Now())
 	reply.VoteGranted = true
 }
 
@@ -325,6 +326,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.stateLock.Lock()
 
 	if args.Term < rf.currentTerm {
+		rf.stateLock.Unlock()
+
+		Debug(dAlive, "[S%v -> S%v] S%v receive expired heartbeat", args.LeaderId, rf.me, rf.me)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
@@ -334,7 +338,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.nextState(Follower, args.Term, true)
 	rf.stateLock.Unlock()
 
-	Debug(dAlive, "[S%v -> S%v] S%v receive heartbeat", args.LeaderId, rf.me, rf.me)
+	Debug(dAlive, "[S%v -> S%v] S%v receive leader's heartbeat", args.LeaderId, rf.me, rf.me)
 	rf.setLastContact(time.Now())
 }
 
@@ -433,10 +437,10 @@ func (rf *Raft) startElection(currentTerm int) {
 	}
 }
 
-func (rf *Raft) runFollower(contactLeader bool) {
+func (rf *Raft) runFollower(contact bool) {
 	rf.stateLock.Lock()
-	// 如果时限内没有收到心跳信息
-	if !contactLeader && rf.voteFor == -1 {
+	// 如果本次计时内没有收到心跳或者投出过票
+	if !contact {
 		Debug(dTimer, "S%v time out, start election", rf.me)
 
 		rf.nextState(Candidate, -1, true)
@@ -504,6 +508,8 @@ func (rf *Raft) runLeader() {
 			if !rf.SendAppendEntries(server, &args, &reply) {
 				return
 			}
+
+			Debug(dAlive, "[S%v <- S%v] S%v receive a follower reponse", rf.me, server, rf.me)
 
 			rf.stateLock.Lock()
 			defer rf.stateLock.Unlock()
