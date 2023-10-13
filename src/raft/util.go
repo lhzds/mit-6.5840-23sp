@@ -9,7 +9,7 @@ import (
 )
 
 // Debugging
-const debug = false
+const debugMode = true
 
 // Retrieve the verbosity level from an environment variable
 func getVerbosity() int {
@@ -34,6 +34,7 @@ const (
 	dVote  logTopic = "VOTE" // 投票消息
 	dAlive logTopic = "LIVE" // Leader 发送心跳 keep alive
 	dNet   logTopic = "NETW" // 网络分区情况
+	dRepl  logTopic = "REPL" // 日志复制消息
 )
 
 var debugStart time.Time
@@ -47,11 +48,27 @@ func init() {
 }
 
 func Debug(topic logTopic, format string, a ...interface{}) {
-	if debug {
+	if debugMode {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
 		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
 		format = prefix + format
 		log.Printf(format, a...)
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func min(a, b int) int {
+	if a > b {
+		return a
+	} else {
+		return b
 	}
 }
