@@ -653,6 +653,11 @@ func (rf *Raft) startElection(currentTerm int) {
 			if reply.VoteGranted {
 				Debug(dVote, "[S%v <- S%v] S%v receive a vote", rf.me, server, rf.me)
 				rf.AddGrantedVotes(1)
+				if int(rf.GetGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
+					Debug(dVote, "S%v receives votes from majority of servers", rf.me)
+					rf.nextTermAndState(Leader, 0, false)
+					return
+				}
 			}
 		}()
 	}
@@ -677,13 +682,6 @@ func (rf *Raft) candidateTicker() {
 	// 可能接受了其他节点 Term 更高的信息而转变为 Follower，因此这里需检测状态是否已经发生改变
 	rf.mu.Lock()
 	if rf.state != Candidate {
-		rf.mu.Unlock()
-		return
-	}
-
-	if int(rf.GetGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
-		Debug(dVote, "S%v receives votes from majority of servers", rf.me)
-		rf.nextTermAndState(Leader, 0, true)
 		rf.mu.Unlock()
 		return
 	}
@@ -754,7 +752,7 @@ func (rf *Raft) ticker() {
 			Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
 			rf.mu.Unlock()
 			time.Sleep(timeout)
-
+			Debug(dTimer, "S%v [%v |vs.| %v]", rf.me, time.Since(rf.GetLastContact()), timeout)
 			rf.followerTicker(time.Since(rf.GetLastContact()) <= timeout)
 		case Candidate:
 			timeout := electionTimeout * time.Millisecond
