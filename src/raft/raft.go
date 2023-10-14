@@ -176,6 +176,12 @@ func (rf *Raft) getLastIndexAndTerm() (lastIndex int, lastTerm int) {
 	return
 }
 
+func (rf *Raft) getRaftState() RaftState {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state
+}
+
 func (rf *Raft) getLogTerm(index int) (term int) {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
@@ -183,27 +189,28 @@ func (rf *Raft) getLogTerm(index int) (term int) {
 	return
 }
 
-func (rf *Raft) writeLogEntriesImpl(start int, entries []LogEntry) {
+func (rf *Raft) writeLogEntriesImpl(start int, entries ...LogEntry) {
 	if start < len(rf.log) {
 		Debug(dRepl, "[S%v's Len(Log): %v -> %v] S%v delete inconsistent entries",
 			rf.me, len(rf.log), start, rf.me)
+		rf.log = rf.log[:start]
 	}
 
 	Debug(dRepl, "[S%v's Len(Log): %v -> %v] S%v write entries locally",
 		rf.me, start, start+len(entries), rf.me)
-	copy(rf.log[start:], entries)
+	rf.log = append(rf.log, entries...)
 }
 
-func (rf *Raft) writeLogEntries(start int, entries []LogEntry) {
+func (rf *Raft) writeLogEntries(start int, entries ...LogEntry) {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
-	rf.writeLogEntriesImpl(start, entries)
+	rf.writeLogEntriesImpl(start, entries...)
 }
 
-func (rf *Raft) appendLogEntries(entries []LogEntry) {
+func (rf *Raft) appendLogEntries(entries ...LogEntry) {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
-	rf.writeLogEntriesImpl(len(rf.log), entries)
+	rf.writeLogEntriesImpl(len(rf.log), entries...)
 }
 
 func (rf *Raft) getLogEntries(start int, end int) []LogEntry {
@@ -225,7 +232,10 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 // 新选举产生的 Leader 需要执行的操作
-func (rf *Raft) enThrone() {
+func (rf *Raft) enThrone(currentTerm int) {
+	// 向所有节点发送心跳信号
+	rf.heartbeat(currentTerm)
+
 	// 初始化数据结构，为一个节点启动一个复制协程
 	rf.repls = make([]FollowerRepl, len(rf.peers))
 	for server := 0; server < len(rf.repls); server++ {
@@ -240,7 +250,6 @@ func (rf *Raft) enThrone() {
 		go rf.replicator(&rf.repls[server])
 	}
 
-	// TODO：发送 no-op 日志项
 }
 
 // Leader 退位时的清理工作
@@ -291,17 +300,19 @@ func (rf *Raft) nextTermAndState(newState RaftState, newTerm int, holdLock bool)
 	if rf.state == Leader {
 		defer rf.stepDown() // 旧 Leader 退位
 	}
-	if newState == Leader {
-		defer rf.enThrone() // 新 Leader 上位
-	}
+
 	switch newState {
 	case Leader:
 		rf.state = Leader
+		go rf.leaderTicker()
+		defer rf.enThrone(rf.currentTerm) // 新 Leader 上位
 	case Follower:
 		rf.state = Follower
+		go rf.followerTicker()
 	case Candidate:
 		rf.state = Candidate
 		rf.voteFor = rf.me
+		go rf.candidateTicker()
 	}
 }
 
@@ -492,7 +503,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	new := min(max(old, args.LeaderCommit), rf.getLastIndex())
 	rf.setCommitIndex(new)
 	if new > old {
-		Debug(dRepl, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
+		Debug(dCommit, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
 			rf.me, old, new, rf.me)
 		rf.notifyApply()
 	}
@@ -547,7 +558,7 @@ SUCCESS:
 	reply.Success = true
 	Debug(dRepl, "[S%v -> S%v] S%v accept new entries",
 		args.LeaderId, rf.me, rf.me)
-	rf.writeLogEntries(tmpIndex+1, args.Entries)
+	rf.writeLogEntries(tmpIndex+1, args.Entries...)
 	return
 FAIL:
 	reply.Success = false
@@ -574,7 +585,7 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-	index := rf.getLastIndex() + 1
+	index := rf.getLastIndex() + 2 // 上层应用下标从 1 开始，因此要比实际加一
 	rf.mu.Lock()
 	term := rf.currentTerm
 	isLeader := (rf.state == Leader)
@@ -582,7 +593,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	if isLeader {
 		Debug(dRepl, "S%v accept a new cmd from client", rf.me)
-		rf.appendLogEntries([]LogEntry{{Term: term, Cmd: command}})
+		rf.appendLogEntries(LogEntry{Term: term, Cmd: command})
 		rf.notifyRepl()
 	}
 
@@ -639,23 +650,21 @@ func (rf *Raft) startElection(currentTerm int) {
 			}
 
 			rf.mu.Lock()
+			defer rf.mu.Unlock()
 			if reply.Term < rf.currentTerm { // 说明选票过期了，当前节点开启的新的选举或者已经不是 Candidate
-				rf.mu.Unlock()
 				return
 			}
 			if reply.Term > rf.currentTerm { // 说明当前节点过期了
 				rf.nextTermAndState(Follower, reply.Term, true)
-				rf.mu.Unlock()
 				return
 			}
-			rf.mu.Unlock()
 
-			if reply.VoteGranted {
-				Debug(dVote, "[S%v <- S%v] S%v receive a vote", rf.me, server, rf.me)
+			Debug(dVote, "[S%v <- S%v] S%v receive a vote", rf.me, server, rf.me)
+			if rf.state == Candidate && reply.VoteGranted {
 				rf.AddGrantedVotes(1)
 				if int(rf.GetGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
 					Debug(dVote, "S%v receives votes from majority of servers", rf.me)
-					rf.nextTermAndState(Leader, 0, false)
+					rf.nextTermAndState(Leader, 0, true)
 					return
 				}
 			}
@@ -663,52 +672,58 @@ func (rf *Raft) startElection(currentTerm int) {
 	}
 }
 
-func (rf *Raft) followerTicker(contact bool) {
-	rf.mu.Lock()
-	// 如果本次计时内没有收到心跳或者投出过票
-	if !contact {
-		Debug(dTimer, "S%v time out, start election", rf.me)
+func (rf *Raft) followerTicker() {
+	for !rf.killed() && rf.getRaftState() == Follower {
+		timeout := time.Duration(50+(rand.Int63()%300)) * time.Millisecond
+		Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
+		time.Sleep(timeout)
 
-		rf.nextTermAndState(Candidate, -1, true)
-		currentTerm := rf.currentTerm
+		rf.mu.Lock()
+		if rf.state != Follower {
+			rf.mu.Unlock()
+			break
+		}
+
+		// 如果本次计时内没有收到心跳或者投出过票
+		if elapsed := time.Since(rf.GetLastContact()); elapsed > timeout {
+			Debug(dTimer, "S%v time out(%v pass since the last cantact), start election",
+				rf.me, elapsed)
+
+			rf.nextTermAndState(Candidate, -1, true)
+			currentTerm := rf.currentTerm
+			rf.mu.Unlock()
+			rf.startElection(currentTerm)
+			return
+		}
+
 		rf.mu.Unlock()
-		rf.startElection(currentTerm)
-		return
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) candidateTicker() {
-	// 可能接受了其他节点 Term 更高的信息而转变为 Follower，因此这里需检测状态是否已经发生改变
-	rf.mu.Lock()
-	if rf.state != Candidate {
+	for !rf.killed() && rf.getRaftState() == Candidate {
+		timeout := time.Duration(50+(rand.Int63()%300)) * time.Millisecond
+		Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
+		time.Sleep(timeout)
+
+		rf.mu.Lock()
+		if rf.state != Candidate {
+			rf.mu.Unlock()
+			break
+		}
+
+		//发起一轮新的选举
+		Debug(dTimer, "S%v time out, start a new election", rf.me)
+		rf.nextTermAndState(Candidate, -1, true)
+		currentTerm := rf.currentTerm
 		rf.mu.Unlock()
-		return
+
+		rf.startElection(currentTerm)
 	}
-
-	//发起一轮新的选举
-	Debug(dTimer, "S%v time out, start a new election", rf.me)
-	rf.nextTermAndState(Candidate, -1, true)
-	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
-
-	rf.startElection(currentTerm)
 }
 
-func (rf *Raft) leaderTicker() {
-	// 可能已经退位了
-	rf.mu.Lock()
-	if rf.state != Leader {
-		rf.mu.Unlock()
-		return
-	}
-
-	// 向所有 Follower 发送心跳信号
-	Debug(dTimer, "S%v send heartbeat to all servers", rf.me)
-	currentTerm := rf.currentTerm
-	rf.mu.Unlock()
-	leadCommit := rf.getCommitIndex()
-
+func (rf *Raft) heartbeat(currentTerm int) {
+	leaderCommit := rf.getCommitIndex()
 	for server := 0; server < len(rf.peers); server++ {
 		if server == rf.me {
 			continue
@@ -719,7 +734,7 @@ func (rf *Raft) leaderTicker() {
 			args := AppendEntriesArgs{
 				Term:         currentTerm,
 				LeaderId:     rf.me,
-				LeaderCommit: leadCommit,
+				LeaderCommit: leaderCommit,
 			}
 			reply := AppendEntriesReply{}
 
@@ -739,38 +754,24 @@ func (rf *Raft) leaderTicker() {
 	}
 }
 
-// 计时器，用于执行特定状态对应的定时事件
-func (rf *Raft) ticker() {
-	for !rf.killed() {
-		// Your code here (2A)
-		electionTimeout := time.Duration(50 + (rand.Int63() % 300))
+func (rf *Raft) leaderTicker() {
+	for !rf.killed() && rf.getRaftState() == Leader {
+		timeout := time.Duration(50+(rand.Int63()%300)) * time.Millisecond / 10
+		Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
+		time.Sleep(timeout)
 
 		rf.mu.Lock()
-		switch rf.state {
-		case Follower:
-			timeout := electionTimeout * time.Millisecond
-			Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
+		if rf.state != Leader {
 			rf.mu.Unlock()
-			time.Sleep(timeout)
-			Debug(dTimer, "S%v [%v |vs.| %v]", rf.me, time.Since(rf.GetLastContact()), timeout)
-			rf.followerTicker(time.Since(rf.GetLastContact()) <= timeout)
-		case Candidate:
-			timeout := electionTimeout * time.Millisecond
-			Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
-			rf.mu.Unlock()
-			time.Sleep(timeout)
-
-			rf.candidateTicker()
-		case Leader:
-			timeout := electionTimeout * time.Millisecond / 5
-			Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
-			rf.mu.Unlock()
-			time.Sleep(timeout)
-
-			rf.leaderTicker()
+			break
 		}
+		currentTerm := rf.currentTerm
+		rf.mu.Unlock()
+
+		// 向所有 Follower 发送心跳信号
+		Debug(dTimer, "S%v send heartbeat to all servers", rf.me)
+		rf.heartbeat(currentTerm)
 	}
-	Debug(dState, "[dead] S%v is killed", rf.me)
 }
 
 func (rf *Raft) notifyRepl() {
@@ -794,7 +795,6 @@ func (rf *Raft) replOneRound(replState *FollowerRepl) {
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	rf.mu.Unlock()
-
 	for replState.nextIndex <= lastIndex {
 		replState.mu.Lock()
 		if replState.shouldStop {
@@ -888,7 +888,7 @@ func (rf *Raft) tryCommit() {
 	})
 	new := matchIndexs[rf.quorumSize()-1]
 	if old := rf.getCommitIndex(); new > old {
-		Debug(dRepl, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
+		Debug(dCommit, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
 			rf.me, old, new, rf.me)
 		rf.setCommitIndex(new)
 		rf.notifyApply()
@@ -930,12 +930,12 @@ func (rf *Raft) applyOneRound() {
 		command := rf.getLogEntries(rf.lastApplied+1, rf.lastApplied+2)[0].Cmd
 		applyMsg := ApplyMsg{
 			CommandValid: true,
-			CommandIndex: rf.lastApplied + 2, // 上层状态机下标从 1 开始，所以这里需要再加一
+			CommandIndex: rf.lastApplied + 2, // 上层应用下标从 1 开始，因此要比实际加一
 			Command:      command,
 		}
 		rf.applyCh <- applyMsg
 		rf.lastApplied++
-		Debug(dRepl, "S%v applied log[%v]", rf.me, rf.lastApplied)
+		Debug(dCommit, "S%v try to apply log[%v]", rf.me, rf.lastApplied)
 	}
 }
 
@@ -980,8 +980,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// 启动计时协程，用于调用不同状态对应的定时事件
-	go rf.ticker()
+	// 启动 follower 计时协程
+	go rf.followerTicker()
 
 	// 启动 apply 协程，用于对数据进行 apply
 	go rf.applier()

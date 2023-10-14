@@ -9,7 +9,7 @@ import (
 )
 
 // Debugging
-const debugMode = true
+const debugMode = false
 
 // Retrieve the verbosity level from an environment variable
 func getVerbosity() int {
@@ -28,13 +28,14 @@ func getVerbosity() int {
 type logTopic string
 
 const (
-	dTerm  logTopic = "TERM" // Term 发生变化
-	dState logTopic = "STAT" // 状态发生变化
-	dTimer logTopic = "TIMR" // 定时器触发
-	dVote  logTopic = "VOTE" // 投票消息
-	dAlive logTopic = "LIVE" // Leader 发送心跳 keep alive
-	dNet   logTopic = "NETW" // 网络分区情况
-	dRepl  logTopic = "REPL" // 日志复制消息
+	dTerm   logTopic = "TERM" // Term 发生变化
+	dState  logTopic = "STAT" // 状态发生变化
+	dTimer  logTopic = "TIMR" // 定时器触发
+	dVote   logTopic = "VOTE" // 投票消息
+	dAlive  logTopic = "LIVE" // Leader 发送心跳 keep alive
+	dNet    logTopic = "NETW" // 网络分区情况
+	dRepl   logTopic = "REPL" // 日志复制消息
+	dCommit logTopic = "CMIT" // 日志提交和应用
 )
 
 var debugStart time.Time
