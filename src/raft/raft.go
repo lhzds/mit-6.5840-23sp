@@ -132,27 +132,35 @@ type Raft struct {
 	grantedVotes uint32 // 本轮收到的票数
 
 	// Leader
-	repls      []FollowerRepl
+	repls      atomic.Value
 	commitment *Commitment
 }
 
-func (rf *Raft) GetGrantedVotes() uint32 {
+func (rf *Raft) setRepls(repls []FollowerRepl) {
+	rf.repls.Store(repls)
+}
+
+func (rf *Raft) getRepls() []FollowerRepl {
+	return rf.repls.Load().([]FollowerRepl)
+}
+
+func (rf *Raft) getGrantedVotes() uint32 {
 	return atomic.LoadUint32(&rf.grantedVotes)
 }
 
-func (rf *Raft) SetGrantedVotes(grantedVotes uint32) {
+func (rf *Raft) setGrantedVotes(grantedVotes uint32) {
 	atomic.StoreUint32(&rf.grantedVotes, grantedVotes)
 }
 
-func (rf *Raft) AddGrantedVotes(delta uint32) {
+func (rf *Raft) addGrantedVotes(delta uint32) {
 	atomic.AddUint32(&rf.grantedVotes, delta)
 }
 
-func (rf *Raft) GetLastContact() time.Time {
+func (rf *Raft) getLastContact() time.Time {
 	return rf.lastContact.Load().(time.Time)
 }
 
-func (rf *Raft) SetLastContact(t time.Time) {
+func (rf *Raft) setLastContact(t time.Time) {
 	rf.lastContact.Store(t)
 }
 
@@ -267,16 +275,25 @@ func (rf *Raft) enThrone(currentTerm int) {
 	// 向所有节点发送心跳信号
 	rf.heartbeat(currentTerm)
 
-	rf.repls = make([]FollowerRepl, len(rf.peers))
-	for server := 0; server < len(rf.repls); server++ {
+	repls := make([]FollowerRepl, len(rf.peers))
+	for server := 0; server < len(rf.peers); server++ {
 		if server == rf.me {
 			continue
 		}
 
-		rf.repls[server].server = server
-		rf.repls[server].cond = *sync.NewCond(&rf.repls[server].mu)
-		rf.repls[server].nextIndex = rf.getLastIndex() + 1 // 初始时先不开始复制
-		go rf.replicator(&rf.repls[server], rf.commitment)
+		repls[server].server = server
+		repls[server].cond = *sync.NewCond(&repls[server].mu)
+		repls[server].nextIndex = rf.getLastIndex() + 1 // 初始时先不开始复制
+
+	}
+	rf.setRepls(repls)
+
+	// 启动复制协程
+	for server := 0; server < len(rf.peers); server++ {
+		if server == rf.me {
+			continue
+		}
+		go rf.replicator(&repls[server], rf.commitment)
 	}
 
 }
@@ -284,15 +301,16 @@ func (rf *Raft) enThrone(currentTerm int) {
 // Leader 退位时的清理工作
 func (rf *Raft) stepDown() {
 	// 停止所有的复制协程
-	for i := 0; i < len(rf.repls); i++ {
-		rf.repls[i].mu.Lock()
-		rf.repls[i].shouldStop = true
-		rf.repls[i].cond.Signal()
-		rf.repls[i].mu.Unlock()
+	repls := rf.getRepls()
+	for i := 0; i < len(repls); i++ {
+		repls[i].mu.Lock()
+		repls[i].shouldStop = true
+		repls[i].cond.Signal()
+		repls[i].mu.Unlock()
 	}
 	// 设置数据结构为 nil，避免内存泄漏
 	rf.commitment = nil
-	rf.repls = nil
+	rf.setRepls(nil)
 }
 
 // 更新 Term 以及状态
@@ -452,7 +470,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 同意投票
 	Debug(dVote, "[S%v -> S%v] S%v argees to vote", args.CandidateId, rf.me, rf.me)
 	rf.voteFor = args.CandidateId
-	rf.SetLastContact(time.Now())
+	rf.setLastContact(time.Now())
 	reply.VoteGranted = true
 }
 
@@ -528,7 +546,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	rf.mu.Unlock()
 
-	rf.SetLastContact(time.Now())
+	rf.setLastContact(time.Now())
 
 	// 如果是心跳信息
 	if len(args.Entries) == 0 {
@@ -667,7 +685,7 @@ func (rf *Raft) quorumSize() int {
 }
 
 func (rf *Raft) startElection(currentTerm int) {
-	rf.SetGrantedVotes(1) // 先给自己投一票
+	rf.setGrantedVotes(1) // 先给自己投一票
 	lastLogIndex, lastLogTerm := rf.getLastIndexAndTerm()
 
 	for server := 0; server < len(rf.peers); server++ {
@@ -702,8 +720,8 @@ func (rf *Raft) startElection(currentTerm int) {
 
 			Debug(dVote, "[S%v <- S%v] S%v receive a vote", rf.me, server, rf.me)
 			if rf.state == Candidate && reply.VoteGranted {
-				rf.AddGrantedVotes(1)
-				if int(rf.GetGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
+				rf.addGrantedVotes(1)
+				if int(rf.getGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
 					Debug(dVote, "S%v receives votes from majority of servers", rf.me)
 					rf.nextTermAndState(Leader, 0, true)
 					return
@@ -726,7 +744,7 @@ func (rf *Raft) followerTicker() {
 		}
 
 		// 如果本次计时内没有收到心跳或者投出过票
-		if elapsed := time.Since(rf.GetLastContact()); elapsed > timeout {
+		if elapsed := time.Since(rf.getLastContact()); elapsed > timeout {
 			Debug(dTimer, "S%v time out(%v pass since the last cantact), start election",
 				rf.me, elapsed)
 
@@ -819,17 +837,21 @@ func (rf *Raft) leaderTicker() {
 
 func (rf *Raft) notifyRepl() {
 	// 唤醒复制协程进行日志分发
-	for server := 0; server < len(rf.repls); server++ {
+	repls := rf.getRepls()
+	if repls == nil {
+		return
+	}
+	for server := 0; server < len(repls); server++ {
 		if server == rf.me {
 			continue
 		}
 
-		rf.repls[server].mu.Lock()
-		if !rf.repls[server].shouldRepl {
-			rf.repls[server].shouldRepl = true
-			rf.repls[server].cond.Signal()
+		repls[server].mu.Lock()
+		if !repls[server].shouldRepl {
+			repls[server].shouldRepl = true
+			repls[server].cond.Signal()
 		}
-		rf.repls[server].mu.Unlock()
+		repls[server].mu.Unlock()
 	}
 }
 
@@ -1025,7 +1047,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteFor = -1
 	rf.commitIndex = -1
 	rf.lastApplied = -1
-	rf.SetLastContact(time.Time{})
+	rf.setLastContact(time.Time{})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
