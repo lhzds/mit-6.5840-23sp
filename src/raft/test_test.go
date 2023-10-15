@@ -63,22 +63,18 @@ func TestReElection2A(t *testing.T) {
 
 	// if the leader disconnects, a new one should be elected.
 	cfg.disconnect(leader1)
-	Debug(dNet, "S%v left from network", leader1)
 	cfg.checkOneLeader()
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
 	cfg.connect(leader1)
-	Debug(dNet, "S%v rejoin network", leader1)
 	leader2 := cfg.checkOneLeader()
 
 	// if there's no quorum, no new leader should
 	// be elected.
 	cfg.disconnect(leader2)
-	Debug(dNet, "S%v left from network", leader2)
 	cfg.disconnect((leader2 + 1) % servers)
-	Debug(dNet, "S%v left from network", (leader2+1)%servers)
 	time.Sleep(2 * RaftElectionTimeout)
 
 	// check that the one connected server
@@ -87,12 +83,10 @@ func TestReElection2A(t *testing.T) {
 
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
-	Debug(dNet, "S%v rejoin network", (leader2+1)%servers)
 	cfg.checkOneLeader()
 
 	// re-join of last node shouldn't prevent leader from existing.
 	cfg.connect(leader2)
-	Debug(dNet, "S%v rejoin network", leader2)
 	cfg.checkOneLeader()
 
 	cfg.end()
@@ -588,8 +582,10 @@ func TestCount2B(t *testing.T) {
 
 	total1 := rpcs()
 
-	if total1 > 30 || total1 < 1 {
-		t.Fatalf("too many or few RPCs (%v) to elect initial leader\n", total1)
+	if total1 > 30 {
+		t.Fatalf("too many RPCs (%v) to elect initial leader\n", total1)
+	} else if total1 < 1 {
+		t.Fatalf("too few RPCs (%v) to elect initial leader\n", total1)
 	}
 
 	var total2 int

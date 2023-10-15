@@ -799,7 +799,7 @@ func (rf *Raft) heartbeat(currentTerm int) {
 
 func (rf *Raft) leaderTicker() {
 	for !rf.killed() && rf.getRaftState() == Leader {
-		timeout := time.Duration(50+(rand.Int63()%300)) * time.Millisecond / 10
+		timeout := time.Duration(50+(rand.Int63()%300)) * time.Millisecond / 5
 		Debug(dTimer, "S%v reset timer with %v timeout", rf.me, timeout)
 		time.Sleep(timeout)
 
