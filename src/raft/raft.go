@@ -526,24 +526,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// term 冲突
-	if rf.getLogTerm(tmpIndex) != args.PrevLogTerm {
-		// 跳过过高的 Term（这一步可以不要）
-		for tmpIndex >= 0 && rf.getLogTerm(tmpIndex) > args.PrevLogTerm {
-			tmpIndex--
-		}
-		if tmpIndex < 0 { // 全部都大于，处理等同于日志过短不存在冲突项目的 Term 的情况
+	if xTerm := rf.getLogTerm(tmpIndex); xTerm != args.PrevLogTerm {
+		// 过高的 Term 跳过，等同于日志过短的情况
+		if xTerm > args.PrevLogTerm {
+			for tmpIndex >= 0 && rf.getLogTerm(tmpIndex) > args.PrevLogTerm {
+				tmpIndex--
+			}
 			reply.XTerm = -1
-			reply.XLen = args.PrevLogIndex
+			reply.XLen = args.PrevLogIndex - tmpIndex
 			goto FAIL
 		}
 
-		// 当第一个 term 为 XTerm 日志项的 index
-		for tmpIndex >= 0 && rf.getLogTerm(tmpIndex) == args.PrevLogTerm {
+		// 当第一个 term 为 XTerm 日志项
+		reply.XTerm = xTerm
+		for tmpIndex-1 >= 0 && rf.getLogTerm(tmpIndex-1) == xTerm {
 			tmpIndex--
 		}
-
-		reply.XIndex = tmpIndex + 1
-		reply.Term = rf.getLogTerm(tmpIndex)
+		reply.XIndex = tmpIndex
 		goto FAIL
 	}
 
@@ -568,6 +567,7 @@ SUCCESS:
 		args.LeaderId, rf.me, rf.me)
 	rf.writeLogEntries(tmpIndex+1, args.Entries...)
 	return
+
 FAIL:
 	reply.Success = false
 	if len(args.Entries) == 0 {
@@ -863,11 +863,11 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 		reply := AppendEntriesReply{}
 
 		// 失败 nextIndex 没有更新，下一轮重新尝试
-		Debug(dRepl, "[S%v -> S%v] S%v send a repl request", rf.me, replState.server, rf.me)
+		Debug(dRepl, "[S%v -> S%v] S%v send a repl request(prevIndex: %v, prevTerm: %v)",
+			rf.me, replState.server, rf.me, prevLogIndex, prevLogTerm)
 		if !rf.SendAppendEntries(replState.server, &args, &reply) {
 			continue
 		}
-		Debug(dRepl, "[S%v <- S%v] S%v receive a repl response", rf.me, replState.server, rf.me)
 
 		// 如果过期则直接结束复制
 		rf.mu.Lock()
@@ -880,6 +880,9 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 
 		// 复制成功，尝试进行提交
 		if reply.Success {
+			Debug(dRepl,
+				"[S%v <- S%v] S%v receive a agreed repl response",
+				rf.me, replState.server, rf.me)
 			new := commitment.match(replState.server, replState.nextIndex)
 			old := rf.getCommitIndex()
 			if new > old {
@@ -892,6 +895,10 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 			replState.nextIndex++
 			continue
 		}
+
+		Debug(dRepl,
+			"[S%v <- S%v] S%v receive a refuesd repl response(xTerm=%v, xIndex=%v, xLen=%v)",
+			rf.me, replState.server, rf.me, reply.XTerm, reply.XIndex, reply.XLen)
 
 		// follower 日志过短，不存在冲突项
 		if reply.XTerm == -1 {
@@ -910,13 +917,11 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 				tmpIndex = reply.XIndex - 1
 				break
 			}
-
 		}
 		if tmpIndex < reply.XIndex {
 			for ; tmpIndex >= 0 && rf.getLogTerm(tmpIndex) >= reply.XTerm; tmpIndex-- {
 			}
 		}
-
 		replState.nextIndex = tmpIndex + 1
 	}
 }
