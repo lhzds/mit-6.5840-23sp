@@ -84,10 +84,16 @@ type FollowerRepl struct {
 }
 
 type Commitment struct {
-	startIndex int // 大于等于这个下标的日志项都是本 term 的，才能通过计数进行提交
+	startIndex  int     // 大于等于这个下标的日志项都是本 term 的，才能通过计数进行提交
+	matchIndexs []int32 // 日志复制情况，基于这个计算可以更新的 commitIndex
+}
 
-	mu          sync.Mutex
-	matchIndexs []int // 日志复制情况，基于这个计算可以更新的 commitIndex
+func (commitment *Commitment) setMatchIndex(server int, matchIndex int) {
+	atomic.StoreInt32(&commitment.matchIndexs[server], int32(matchIndex))
+}
+
+func (commitment *Commitment) getMatchIndex(server int) int {
+	return int(atomic.LoadInt32(&commitment.matchIndexs[server]))
 }
 
 type LogEntry struct {
@@ -198,18 +204,33 @@ func (rf *Raft) getLogEntries(start int, end int) []LogEntry {
 }
 
 func (rf *Raft) writeLogEntriesImpl(start int, entries ...LogEntry) {
+	// 跳过重复的日志项
+	newEntries := make([]LogEntry, 0)
+	for i := 0; i < len(entries); i++ {
+		if start >= len(rf.log) || entries[i].Term != rf.log[start].Term {
+			newEntries = entries[i:]
+			break
+		}
+		start++
+	}
+
+	// 删除不一致的项
 	if start < len(rf.log) {
 		Debug(dRepl, "[S%v's Len(Log): %v -> %v] S%v delete inconsistent entries",
 			rf.me, len(rf.log), start, rf.me)
 		rf.log = rf.log[:start]
 	}
 
+	// 添加新的项
 	Debug(dRepl, "[S%v's Len(Log): %v -> %v] S%v write entries locally",
-		rf.me, start, start+len(entries), rf.me)
-	rf.log = append(rf.log, entries...)
+		rf.me, start, start+len(newEntries), rf.me)
+	rf.log = append(rf.log, newEntries...)
 }
 
 func (rf *Raft) writeLogEntries(start int, entries ...LogEntry) {
+	if len(entries) == 0 {
+		return
+	}
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
 	rf.writeLogEntriesImpl(start, entries...)
@@ -235,17 +256,16 @@ func (rf *Raft) GetState() (int, bool) {
 
 // 新选举产生的 Leader 需要执行的操作
 func (rf *Raft) enThrone(currentTerm int) {
-	// 向所有节点发送心跳信号
-	rf.heartbeat(currentTerm)
-
-	// 初始化数据结构，以及启动复制协程
 	rf.commitment = &Commitment{
 		startIndex:  rf.getLastIndex() + 1,
-		matchIndexs: make([]int, len(rf.peers)),
+		matchIndexs: make([]int32, len(rf.peers)),
 	}
 	for i := range rf.commitment.matchIndexs {
 		rf.commitment.matchIndexs[i] = -1
 	}
+
+	// 向所有节点发送心跳信号
+	rf.heartbeat(currentTerm)
 
 	rf.repls = make([]FollowerRepl, len(rf.peers))
 	for server := 0; server < len(rf.repls); server++ {
@@ -510,44 +530,58 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.SetLastContact(time.Now())
 
-	// 开始一致性检测
-	tmpIndex := args.PrevLogIndex
-
-	// 特判第0条日志项
-	if tmpIndex == -1 {
+	// 如果是心跳信息
+	if len(args.Entries) == 0 {
 		goto SUCCESS
 	}
 
+	// 特判第0条日志项
+	if args.PrevLogIndex == -1 {
+		goto SUCCESS
+	}
+
+	// 开始一致性检测
 	// 日志过短，不存在冲突的 Term
-	if lastIndex := rf.getLastIndex(); lastIndex < tmpIndex {
+	if lastIndex := rf.getLastIndex(); lastIndex < args.PrevLogIndex {
 		reply.XTerm = -1
 		reply.XLen = args.PrevLogIndex - lastIndex
 		goto FAIL
 	}
 
 	// term 冲突
-	if xTerm := rf.getLogTerm(tmpIndex); xTerm != args.PrevLogTerm {
+	if xTerm := rf.getLogTerm(args.PrevLogIndex); xTerm != args.PrevLogTerm {
 		// 过高的 Term 跳过，等同于日志过短的情况
+		xIndex := args.PrevLogIndex
 		if xTerm > args.PrevLogTerm {
-			for tmpIndex >= 0 && rf.getLogTerm(tmpIndex) > args.PrevLogTerm {
-				tmpIndex--
+			for xIndex >= 0 && rf.getLogTerm(xIndex) > args.PrevLogTerm {
+				xIndex--
 			}
 			reply.XTerm = -1
-			reply.XLen = args.PrevLogIndex - tmpIndex
+			reply.XLen = args.PrevLogIndex - xIndex
 			goto FAIL
 		}
 
 		// 当第一个 term 为 XTerm 日志项
 		reply.XTerm = xTerm
-		for tmpIndex-1 >= 0 && rf.getLogTerm(tmpIndex-1) == xTerm {
-			tmpIndex--
+		for xIndex-1 >= 0 && rf.getLogTerm(xIndex-1) == xTerm {
+			xIndex--
 		}
-		reply.XIndex = tmpIndex
+		reply.XIndex = xIndex
 		goto FAIL
 	}
 
 SUCCESS:
 	reply.Success = true
+
+	// 日志项为空，说明为心跳消息
+	if len(args.Entries) == 0 {
+		Debug(dAlive, "[S%v -> S%v] S%v receive leader's heartbeat", args.LeaderId, rf.me, rf.me)
+	} else {
+		Debug(dRepl, "[S%v -> S%v] S%v prepare to write new entries",
+			args.LeaderId, rf.me, rf.me)
+		rf.writeLogEntries(args.PrevLogIndex+1, args.Entries...)
+	}
+
 	// 进行提交
 	if old, new := rf.getCommitIndex(), min(args.LeaderCommit, rf.getLastIndex()); new > old {
 		rf.setCommitIndex(new)
@@ -556,16 +590,6 @@ SUCCESS:
 		rf.notifyApply()
 	}
 
-	// 日志项为空，说明为心跳消息
-	if len(args.Entries) == 0 {
-		Debug(dAlive, "[S%v -> S%v] S%v receive leader's heartbeat", args.LeaderId, rf.me, rf.me)
-		return
-	}
-
-	// 添加日志项
-	Debug(dRepl, "[S%v -> S%v] S%v accept new entries",
-		args.LeaderId, rf.me, rf.me)
-	rf.writeLogEntries(tmpIndex+1, args.Entries...)
 	return
 
 FAIL:
@@ -741,7 +765,8 @@ func (rf *Raft) candidateTicker() {
 
 func (rf *Raft) heartbeat(currentTerm int) {
 	leaderCommit := rf.getCommitIndex()
-	leaderCommitTerm := rf.getLogTerm(leaderCommit)
+	commitment := rf.commitment
+
 	for server := 0; server < len(rf.peers); server++ {
 		if server == rf.me {
 			continue
@@ -752,9 +777,7 @@ func (rf *Raft) heartbeat(currentTerm int) {
 			args := AppendEntriesArgs{
 				Term:         currentTerm,
 				LeaderId:     rf.me,
-				LeaderCommit: leaderCommit,
-				PrevLogIndex: leaderCommit,
-				PrevLogTerm:  leaderCommitTerm,
+				LeaderCommit: min(leaderCommit, commitment.getMatchIndex(server)),
 			}
 			reply := AppendEntriesReply{}
 
@@ -811,14 +834,12 @@ func (rf *Raft) notifyRepl() {
 }
 
 func (commitment *Commitment) match(server int, matchIndex int) int {
-	commitment.mu.Lock()
-	defer commitment.mu.Unlock()
-	commitment.matchIndexs[server] = matchIndex
+	commitment.setMatchIndex(server, matchIndex)
 
 	// 排序取中位数，计算最大可以提交的 Index
 	matchIndexs := make([]int, 0, len(commitment.matchIndexs))
 	for i := 0; i < len(commitment.matchIndexs); i++ {
-		matchIndexs = append(matchIndexs, commitment.matchIndexs[i])
+		matchIndexs = append(matchIndexs, commitment.getMatchIndex(i))
 	}
 
 	sort.Slice(matchIndexs, func(i, j int) bool {
