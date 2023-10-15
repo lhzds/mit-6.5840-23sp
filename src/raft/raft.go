@@ -79,17 +79,15 @@ type FollowerRepl struct {
 	mu         sync.Mutex
 	cond       sync.Cond
 
-	server     int   // 要复制的服务器
-	nextIndex  int   // 下一个要发送的日志索引
-	matchIndex int32 // 记录已经复制的日志项
+	server    int // 要复制的服务器
+	nextIndex int // 下一个要发送的日志索引
 }
 
-func (fr *FollowerRepl) setMatchIndex(matchIndex int) {
-	atomic.StoreInt32(&fr.matchIndex, int32(matchIndex))
-}
+type Commitment struct {
+	startIndex int // 大于等于这个下标的日志项都是本 term 的，才能通过计数进行提交
 
-func (fr *FollowerRepl) getMatchIndex() int {
-	return int(atomic.LoadInt32(&fr.matchIndex))
+	mu          sync.Mutex
+	matchIndexs []int // 日志复制情况，基于这个计算可以更新的 commitIndex
 }
 
 type LogEntry struct {
@@ -128,7 +126,8 @@ type Raft struct {
 	grantedVotes uint32 // 本轮收到的票数
 
 	// Leader
-	repls []FollowerRepl
+	repls      []FollowerRepl
+	commitment *Commitment
 }
 
 func (rf *Raft) GetGrantedVotes() uint32 {
@@ -159,6 +158,12 @@ func (rf *Raft) getCommitIndex() int {
 	return int(atomic.LoadInt32(&rf.commitIndex))
 }
 
+func (rf *Raft) getRaftState() RaftState {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state
+}
+
 func (rf *Raft) getLastIndex() int {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
@@ -170,23 +175,26 @@ func (rf *Raft) getLastIndexAndTerm() (lastIndex int, lastTerm int) {
 	defer rf.logMu.Unlock()
 	lastIndex = len(rf.log) - 1
 	lastTerm = -1
-	if lastIndex > 0 {
+	if lastIndex >= 0 {
 		lastTerm = rf.log[lastIndex].Term
 	}
 	return
 }
 
-func (rf *Raft) getRaftState() RaftState {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.state
-}
-
 func (rf *Raft) getLogTerm(index int) (term int) {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
-	term = rf.log[index].Term
+	term = -1
+	if index >= 0 {
+		term = rf.log[index].Term
+	}
 	return
+}
+
+func (rf *Raft) getLogEntries(start int, end int) []LogEntry {
+	rf.logMu.Lock()
+	defer rf.logMu.Unlock()
+	return rf.log[start:end]
 }
 
 func (rf *Raft) writeLogEntriesImpl(start int, entries ...LogEntry) {
@@ -213,12 +221,6 @@ func (rf *Raft) appendLogEntries(entries ...LogEntry) {
 	rf.writeLogEntriesImpl(len(rf.log), entries...)
 }
 
-func (rf *Raft) getLogEntries(start int, end int) []LogEntry {
-	rf.logMu.Lock()
-	defer rf.logMu.Unlock()
-	return rf.log[start:end]
-}
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -236,7 +238,15 @@ func (rf *Raft) enThrone(currentTerm int) {
 	// 向所有节点发送心跳信号
 	rf.heartbeat(currentTerm)
 
-	// 初始化数据结构，为一个节点启动一个复制协程
+	// 初始化数据结构，以及启动复制协程
+	rf.commitment = &Commitment{
+		startIndex:  rf.getLastIndex() + 1,
+		matchIndexs: make([]int, len(rf.peers)),
+	}
+	for i := range rf.commitment.matchIndexs {
+		rf.commitment.matchIndexs[i] = -1
+	}
+
 	rf.repls = make([]FollowerRepl, len(rf.peers))
 	for server := 0; server < len(rf.repls); server++ {
 		if server == rf.me {
@@ -245,9 +255,8 @@ func (rf *Raft) enThrone(currentTerm int) {
 
 		rf.repls[server].server = server
 		rf.repls[server].cond = *sync.NewCond(&rf.repls[server].mu)
-		rf.repls[server].matchIndex = -1
 		rf.repls[server].nextIndex = rf.getLastIndex() + 1 // 初始时先不开始复制
-		go rf.replicator(&rf.repls[server])
+		go rf.replicator(&rf.repls[server], rf.commitment)
 	}
 
 }
@@ -262,6 +271,7 @@ func (rf *Raft) stepDown() {
 		rf.repls[i].mu.Unlock()
 	}
 	// 设置数据结构为 nil，避免内存泄漏
+	rf.commitment = nil
 	rf.repls = nil
 }
 
@@ -486,7 +496,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		rf.mu.Unlock()
-		Debug(dAlive, "[S%v -> S%v] S%v receive expired heartbeat", args.LeaderId, rf.me, rf.me)
+		Debug(dAlive, "[S%v -> S%v] S%v receive expired rpc", args.LeaderId, rf.me, rf.me)
 		return
 	}
 
@@ -495,27 +505,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.nextTermAndState(Follower, args.Term, true)
 	}
 
-	rf.mu.Unlock()
 	reply.Term = rf.currentTerm
-
-	// 进行提交
-	old := rf.getCommitIndex()
-	new := min(max(old, args.LeaderCommit), rf.getLastIndex())
-	rf.setCommitIndex(new)
-	if new > old {
-		Debug(dCommit, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
-			rf.me, old, new, rf.me)
-		rf.notifyApply()
-	}
+	rf.mu.Unlock()
 
 	rf.SetLastContact(time.Now())
-
-	// 日志项为空，说明为心跳消息
-	if len(args.Entries) == 0 {
-		Debug(dAlive, "[S%v -> S%v] S%v receive leader's heartbeat", args.LeaderId, rf.me, rf.me)
-		reply.Success = true
-		return
-	}
 
 	// 开始一致性检测
 	tmpIndex := args.PrevLogIndex
@@ -556,13 +549,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 SUCCESS:
 	reply.Success = true
+	// 进行提交
+	if old, new := rf.getCommitIndex(), min(args.LeaderCommit, rf.getLastIndex()); new > old {
+		rf.setCommitIndex(new)
+		Debug(dCommit, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
+			rf.me, old, new, rf.me)
+		rf.notifyApply()
+	}
+
+	// 日志项为空，说明为心跳消息
+	if len(args.Entries) == 0 {
+		Debug(dAlive, "[S%v -> S%v] S%v receive leader's heartbeat", args.LeaderId, rf.me, rf.me)
+		return
+	}
+
+	// 添加日志项
 	Debug(dRepl, "[S%v -> S%v] S%v accept new entries",
 		args.LeaderId, rf.me, rf.me)
 	rf.writeLogEntries(tmpIndex+1, args.Entries...)
 	return
 FAIL:
 	reply.Success = false
-	Debug(dRepl, "[S%v -> S%v] S%v refuses to receive inconsistent entries",
+	if len(args.Entries) == 0 {
+		Debug(dAlive, "[S%v -> S%v] S%v receive leader's heartbeat", args.LeaderId, rf.me, rf.me)
+		return
+	}
+	Debug(dRepl, "[S%v -> S%v] S%v refuses due to inconsistent prev entry",
 		args.LeaderId, rf.me, rf.me)
 }
 
@@ -594,6 +606,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		Debug(dRepl, "S%v accept a new cmd from client", rf.me)
 		rf.appendLogEntries(LogEntry{Term: term, Cmd: command})
+		rf.commitment.match(rf.me, rf.getLastIndex())
 		rf.notifyRepl()
 	}
 
@@ -620,9 +633,13 @@ func (rf *Raft) killed() bool {
 }
 
 // 返回大多数节点的数目
+func quorumSize(n int) int {
+	return (n + 1) / 2
+}
+
 func (rf *Raft) quorumSize() int {
 	// 所有节点数除以 2 向上取整
-	return (len(rf.peers) + 1) / 2
+	return quorumSize(len(rf.peers))
 }
 
 func (rf *Raft) startElection(currentTerm int) {
@@ -724,6 +741,7 @@ func (rf *Raft) candidateTicker() {
 
 func (rf *Raft) heartbeat(currentTerm int) {
 	leaderCommit := rf.getCommitIndex()
+	leaderCommitTerm := rf.getLogTerm(leaderCommit)
 	for server := 0; server < len(rf.peers); server++ {
 		if server == rf.me {
 			continue
@@ -735,6 +753,8 @@ func (rf *Raft) heartbeat(currentTerm int) {
 				Term:         currentTerm,
 				LeaderId:     rf.me,
 				LeaderCommit: leaderCommit,
+				PrevLogIndex: leaderCommit,
+				PrevLogTerm:  leaderCommitTerm,
 			}
 			reply := AppendEntriesReply{}
 
@@ -790,7 +810,29 @@ func (rf *Raft) notifyRepl() {
 	}
 }
 
-func (rf *Raft) replOneRound(replState *FollowerRepl) {
+func (commitment *Commitment) match(server int, matchIndex int) int {
+	commitment.mu.Lock()
+	defer commitment.mu.Unlock()
+	commitment.matchIndexs[server] = matchIndex
+
+	// 排序取中位数，计算最大可以提交的 Index
+	matchIndexs := make([]int, 0, len(commitment.matchIndexs))
+	for i := 0; i < len(commitment.matchIndexs); i++ {
+		matchIndexs = append(matchIndexs, commitment.matchIndexs[i])
+	}
+
+	sort.Slice(matchIndexs, func(i, j int) bool {
+		return matchIndexs[i] > matchIndexs[j]
+	})
+
+	// new >= rf.commitment.startIndex 确保是当前 term 才能进行提交
+	if commitIndex := matchIndexs[quorumSize(len(matchIndexs))-1]; commitIndex >= commitment.startIndex {
+		return commitIndex
+	}
+	return -1
+}
+
+func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 	lastIndex := rf.getLastIndex()
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
@@ -836,9 +878,17 @@ func (rf *Raft) replOneRound(replState *FollowerRepl) {
 		}
 		rf.mu.Unlock()
 
-		// 复制成功
+		// 复制成功，尝试进行提交
 		if reply.Success {
-			replState.setMatchIndex(replState.nextIndex)
+			new := commitment.match(replState.server, replState.nextIndex)
+			old := rf.getCommitIndex()
+			if new > old {
+				Debug(dCommit, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
+					rf.me, old, new, rf.me)
+				rf.setCommitIndex(new)
+				rf.notifyApply()
+			}
+
 			replState.nextIndex++
 			continue
 		}
@@ -871,31 +921,7 @@ func (rf *Raft) replOneRound(replState *FollowerRepl) {
 	}
 }
 
-func (rf *Raft) tryCommit() {
-	// 排序取中位数，计算最大可以提交的 Index
-	matchIndexs := make([]int, 0, len(rf.repls))
-	for server := 0; server < len(rf.repls); server++ {
-		if server == rf.me {
-			continue
-		}
-		matchIndexs = append(matchIndexs, rf.repls[server].getMatchIndex())
-	}
-	// 还要加上 leader 自身的日志长度
-	matchIndexs = append(matchIndexs, rf.getLastIndex()+1)
-
-	sort.Slice(matchIndexs, func(i, j int) bool {
-		return matchIndexs[i] > matchIndexs[j]
-	})
-	new := matchIndexs[rf.quorumSize()-1]
-	if old := rf.getCommitIndex(); new > old {
-		Debug(dCommit, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
-			rf.me, old, new, rf.me)
-		rf.setCommitIndex(new)
-		rf.notifyApply()
-	}
-}
-
-func (rf *Raft) replicator(replState *FollowerRepl) {
+func (rf *Raft) replicator(replState *FollowerRepl, commitment *Commitment) {
 	for !rf.killed() {
 		// 唤醒复制协程
 		replState.mu.Lock()
@@ -910,8 +936,7 @@ func (rf *Raft) replicator(replState *FollowerRepl) {
 		// 执行一轮复制
 		replState.shouldRepl = false
 		replState.mu.Unlock()
-		rf.replOneRound(replState)
-		rf.tryCommit()
+		rf.replOneRound(replState, commitment)
 	}
 }
 
@@ -925,8 +950,7 @@ func (rf *Raft) notifyApply() {
 }
 
 func (rf *Raft) applyOneRound() {
-	commitIndex := rf.getCommitIndex()
-	for rf.lastApplied < commitIndex {
+	for rf.lastApplied < rf.getCommitIndex() {
 		command := rf.getLogEntries(rf.lastApplied+1, rf.lastApplied+2)[0].Cmd
 		applyMsg := ApplyMsg{
 			CommandValid: true,
