@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sort"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -109,12 +111,12 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	mu          sync.Mutex // 用于保护接下来三个变量
-	currentTerm int
-	state       RaftState
-	voteFor     int
+	CurrentTerm int
+	State       RaftState
+	VoteFor     int
 
 	logMu sync.Mutex // 用于保护日志
-	log   []LogEntry // 日志
+	Log   []LogEntry // 日志
 
 	commitIndex int32 // 当前节点已经提交的最大日志 Index
 	lastApplied int   //当前已经应用到状态机的最大日志 Index
@@ -175,22 +177,22 @@ func (rf *Raft) getCommitIndex() int {
 func (rf *Raft) getRaftState() RaftState {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.state
+	return rf.State
 }
 
 func (rf *Raft) getLastIndex() int {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
-	return len(rf.log) - 1
+	return len(rf.Log) - 1
 }
 
 func (rf *Raft) getLastIndexAndTerm() (lastIndex int, lastTerm int) {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
-	lastIndex = len(rf.log) - 1
+	lastIndex = len(rf.Log) - 1
 	lastTerm = -1
 	if lastIndex >= 0 {
-		lastTerm = rf.log[lastIndex].Term
+		lastTerm = rf.Log[lastIndex].Term
 	}
 	return
 }
@@ -200,7 +202,7 @@ func (rf *Raft) getLogTerm(index int) (term int) {
 	defer rf.logMu.Unlock()
 	term = -1
 	if index >= 0 {
-		term = rf.log[index].Term
+		term = rf.Log[index].Term
 	}
 	return
 }
@@ -208,31 +210,35 @@ func (rf *Raft) getLogTerm(index int) (term int) {
 func (rf *Raft) getLogEntries(start int, end int) []LogEntry {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
-	return rf.log[start:end]
+	return rf.Log[start:end]
 }
 
 func (rf *Raft) writeLogEntriesImpl(start int, entries ...LogEntry) {
 	// 跳过重复的日志项
 	newEntries := make([]LogEntry, 0)
 	for i := 0; i < len(entries); i++ {
-		if start >= len(rf.log) || entries[i].Term != rf.log[start].Term {
+		if start >= len(rf.Log) || entries[i].Term != rf.Log[start].Term {
 			newEntries = entries[i:]
 			break
 		}
 		start++
 	}
+	if len(newEntries) == 0 {
+		return
+	}
 
 	// 删除不一致的项
-	if start < len(rf.log) {
+	if start < len(rf.Log) {
 		Debug(dRepl, "[S%v's Len(Log): %v -> %v] S%v delete inconsistent entries",
-			rf.me, len(rf.log), start, rf.me)
-		rf.log = rf.log[:start]
+			rf.me, len(rf.Log), start, rf.me)
+		rf.Log = rf.Log[:start]
 	}
 
 	// 添加新的项
 	Debug(dRepl, "[S%v's Len(Log): %v -> %v] S%v write entries locally",
 		rf.me, start, start+len(newEntries), rf.me)
-	rf.log = append(rf.log, newEntries...)
+	rf.Log = append(rf.Log, newEntries...)
+	rf.persist()
 }
 
 func (rf *Raft) writeLogEntries(start int, entries ...LogEntry) {
@@ -244,10 +250,12 @@ func (rf *Raft) writeLogEntries(start int, entries ...LogEntry) {
 	rf.writeLogEntriesImpl(start, entries...)
 }
 
-func (rf *Raft) appendLogEntries(entries ...LogEntry) {
+func (rf *Raft) appendLogEntries(entries ...LogEntry) (appendIdx int) {
 	rf.logMu.Lock()
 	defer rf.logMu.Unlock()
-	rf.writeLogEntriesImpl(len(rf.log), entries...)
+	appendIdx = len(rf.Log)
+	rf.writeLogEntriesImpl(len(rf.Log), entries...)
+	return
 }
 
 // return currentTerm and whether this server
@@ -257,8 +265,8 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	var term = rf.currentTerm
-	var isleader = (rf.state == Leader)
+	var term = rf.CurrentTerm
+	var isleader = (rf.State == Leader)
 	return term, isleader
 }
 
@@ -325,41 +333,41 @@ func (rf *Raft) nextTermAndState(newState RaftState, newTerm int, holdLock bool)
 	// term 增加
 	switch newTerm {
 	case -1:
-		Debug(dTerm, "[S%v's Term: %v -> %v] S%v's term changed", rf.me, rf.currentTerm,
-			rf.currentTerm+1, rf.me)
-		rf.currentTerm++
-		rf.voteFor = -1 // voteFor 记录本轮 Term 投给谁，因此 term 变了 voteFor 也要更新
+		Debug(dTerm, "[S%v's Term: %v -> %v] S%v's term changed", rf.me, rf.CurrentTerm,
+			rf.CurrentTerm+1, rf.me)
+		rf.CurrentTerm++
+		rf.VoteFor = -1 // voteFor 记录本轮 Term 投给谁，因此 term 变了 voteFor 也要更新
 	case 0:
 		// do nothing
 	default:
-		if rf.currentTerm != newTerm {
-			Debug(dTerm, "[S%v's Term: %v -> %v] S%v's term changed", rf.me, rf.currentTerm, newTerm, rf.me)
+		if rf.CurrentTerm != newTerm {
+			Debug(dTerm, "[S%v's Term: %v -> %v] S%v's term changed", rf.me, rf.CurrentTerm, newTerm, rf.me)
 		}
-		rf.currentTerm = newTerm
-		rf.voteFor = -1
+		rf.CurrentTerm = newTerm
+		rf.VoteFor = -1
 	}
 
-	if newState == rf.state {
+	if newState == rf.State {
 		return
 	}
 
 	// 状态转变
-	Debug(dState, "[S%v's State: %s -> %s] S%v's state changed", rf.me, rf.state, newState, rf.me)
-	if rf.state == Leader {
+	Debug(dState, "[S%v's State: %s -> %s] S%v's state changed", rf.me, rf.State, newState, rf.me)
+	if rf.State == Leader {
 		defer rf.stepDown() // 旧 Leader 退位
 	}
 
 	switch newState {
 	case Leader:
-		rf.state = Leader
+		rf.State = Leader
+		rf.enThrone(rf.CurrentTerm) // 新 Leader 上位
 		go rf.leaderTicker()
-		defer rf.enThrone(rf.currentTerm) // 新 Leader 上位
 	case Follower:
-		rf.state = Follower
+		rf.State = Follower
 		go rf.followerTicker()
 	case Candidate:
-		rf.state = Candidate
-		rf.voteFor = rf.me
+		rf.State = Candidate
+		rf.VoteFor = rf.me
 		go rf.candidateTicker()
 	}
 }
@@ -380,6 +388,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	buf := new(bytes.Buffer)
+	e := labgob.NewEncoder(buf)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VoteFor)
+	e.Encode(rf.Log)
+	data := buf.Bytes()
+	rf.persister.Save(data, nil)
 }
 
 // restore previously persisted state.
@@ -400,6 +415,22 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	buf := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(buf)
+	var (
+		CurrentTerm int
+		VoteFor     int
+		Log         []LogEntry
+	)
+	if d.Decode(&CurrentTerm) != nil ||
+		d.Decode(&VoteFor) != nil || d.Decode(&Log) != nil {
+		Debug(dPersist, "s%v fail to read persist state", rf.me)
+		return
+	}
+
+	rf.CurrentTerm = CurrentTerm
+	rf.VoteFor = VoteFor
+	rf.Log = Log
 }
 
 // the service says it has created a snapshot that has
@@ -436,20 +467,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if args.Term < rf.currentTerm {
+	if args.Term < rf.CurrentTerm {
 		Debug(dVote, "[S%v -> S%v]S%v receive a expired RequestVote", args.CandidateId, rf.me, rf.me)
-		reply.Term = rf.currentTerm
+		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = false
 		return
 	}
 
 	// 判断是否为新一轮新的 term
-	if args.Term > rf.currentTerm {
+	if args.Term > rf.CurrentTerm {
 		rf.nextTermAndState(Follower, args.Term, true)
 	}
 
 	// term 已经可以确认下来
-	reply.Term = rf.currentTerm
+	reply.Term = rf.CurrentTerm
 
 	// 比较日志新旧
 	lastLogIndex, lastLogTerm := rf.getLastIndexAndTerm()
@@ -460,7 +491,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// 如果本轮已经投过票，且票不是投给自己（先来先到原则）
-	if rf.voteFor != -1 && args.CandidateId != rf.voteFor {
+	if rf.VoteFor != -1 && args.CandidateId != rf.VoteFor {
 		Debug(dVote, "[S%v -> S%v] S%v refuses to vote due to having voted for other",
 			args.CandidateId, rf.me, rf.me)
 		reply.VoteGranted = false
@@ -469,7 +500,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// 同意投票
 	Debug(dVote, "[S%v -> S%v] S%v argees to vote", args.CandidateId, rf.me, rf.me)
-	rf.voteFor = args.CandidateId
+	rf.VoteFor = args.CandidateId
 	rf.setLastContact(time.Now())
 	reply.VoteGranted = true
 }
@@ -530,8 +561,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 
 	// 拒绝过期信息
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
+	if args.Term < rf.CurrentTerm {
+		reply.Term = rf.CurrentTerm
 		reply.Success = false
 		rf.mu.Unlock()
 		Debug(dAlive, "[S%v -> S%v] S%v receive expired rpc", args.LeaderId, rf.me, rf.me)
@@ -543,7 +574,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.nextTermAndState(Follower, args.Term, true)
 	}
 
-	reply.Term = rf.currentTerm
+	reply.Term = rf.CurrentTerm
 	rf.mu.Unlock()
 
 	rf.setLastContact(time.Now())
@@ -639,20 +670,21 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
-	index := rf.getLastIndex() + 2 // 上层应用下标从 1 开始，因此要比实际加一
 	rf.mu.Lock()
-	term := rf.currentTerm
-	isLeader := (rf.state == Leader)
-	rf.mu.Unlock()
-
-	if isLeader {
+	term := rf.CurrentTerm
+	isLeader := (rf.State == Leader)
+	var index int
+	if isLeader { // 这部分用锁保护，避免退位导致 rf.commitment 变为 nil
 		Debug(dRepl, "S%v accept a new cmd from client", rf.me)
-		rf.appendLogEntries(LogEntry{Term: term, Cmd: command})
+		index = rf.appendLogEntries(LogEntry{Term: term, Cmd: command})
 		rf.commitment.match(rf.me, rf.getLastIndex())
 		rf.notifyRepl()
+	} else {
+		index = rf.getLastIndex() + 1
 	}
+	rf.mu.Unlock()
 
-	return index, term, isLeader
+	return index + 1, term, isLeader // 上层应用下标从 1 开始，因此要比实际加一
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -710,16 +742,16 @@ func (rf *Raft) startElection(currentTerm int) {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			if reply.Term < rf.currentTerm { // 说明选票过期了，当前节点开启的新的选举或者已经不是 Candidate
+			if reply.Term < rf.CurrentTerm { // 说明选票过期了，当前节点开启的新的选举或者已经不是 Candidate
 				return
 			}
-			if reply.Term > rf.currentTerm { // 说明当前节点过期了
+			if reply.Term > rf.CurrentTerm { // 说明当前节点过期了
 				rf.nextTermAndState(Follower, reply.Term, true)
 				return
 			}
 
 			Debug(dVote, "[S%v <- S%v] S%v receive a vote", rf.me, server, rf.me)
-			if rf.state == Candidate && reply.VoteGranted {
+			if rf.State == Candidate && reply.VoteGranted {
 				rf.addGrantedVotes(1)
 				if int(rf.getGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
 					Debug(dVote, "S%v receives votes from majority of servers", rf.me)
@@ -738,7 +770,7 @@ func (rf *Raft) followerTicker() {
 		time.Sleep(timeout)
 
 		rf.mu.Lock()
-		if rf.state != Follower {
+		if rf.State != Follower {
 			rf.mu.Unlock()
 			break
 		}
@@ -749,7 +781,7 @@ func (rf *Raft) followerTicker() {
 				rf.me, elapsed)
 
 			rf.nextTermAndState(Candidate, -1, true)
-			currentTerm := rf.currentTerm
+			currentTerm := rf.CurrentTerm
 			rf.mu.Unlock()
 			rf.startElection(currentTerm)
 			return
@@ -766,7 +798,7 @@ func (rf *Raft) candidateTicker() {
 		time.Sleep(timeout)
 
 		rf.mu.Lock()
-		if rf.state != Candidate {
+		if rf.State != Candidate {
 			rf.mu.Unlock()
 			break
 		}
@@ -774,7 +806,7 @@ func (rf *Raft) candidateTicker() {
 		//发起一轮新的选举
 		Debug(dTimer, "S%v time out, start a new election", rf.me)
 		rf.nextTermAndState(Candidate, -1, true)
-		currentTerm := rf.currentTerm
+		currentTerm := rf.CurrentTerm
 		rf.mu.Unlock()
 
 		rf.startElection(currentTerm)
@@ -808,7 +840,7 @@ func (rf *Raft) heartbeat(currentTerm int) {
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			if reply.Term > rf.currentTerm {
+			if reply.Term > rf.CurrentTerm {
 				rf.nextTermAndState(Follower, reply.Term, true)
 			}
 		}()
@@ -822,15 +854,15 @@ func (rf *Raft) leaderTicker() {
 		time.Sleep(timeout)
 
 		rf.mu.Lock()
-		if rf.state != Leader {
+		if rf.State != Leader {
 			rf.mu.Unlock()
 			break
 		}
-		currentTerm := rf.currentTerm
+		currentTerm := rf.CurrentTerm
 		rf.mu.Unlock()
 
 		// 向所有 Follower 发送心跳信号
-		Debug(dTimer, "S%v send heartbeat to all servers", rf.me)
+		Debug(dAlive, "S%v send heartbeat to all servers", rf.me)
 		rf.heartbeat(currentTerm)
 	}
 }
@@ -878,7 +910,7 @@ func (commitment *Commitment) match(server int, matchIndex int) int {
 func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 	lastIndex := rf.getLastIndex()
 	rf.mu.Lock()
-	currentTerm := rf.currentTerm
+	currentTerm := rf.CurrentTerm
 	rf.mu.Unlock()
 	for replState.nextIndex <= lastIndex {
 		replState.mu.Lock()
@@ -914,7 +946,7 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 
 		// 如果过期则直接结束复制
 		rf.mu.Lock()
-		if rf.currentTerm < reply.Term {
+		if rf.State != Leader || rf.CurrentTerm < reply.Term {
 			rf.nextTermAndState(Follower, reply.Term, true)
 			rf.mu.Unlock()
 			break
@@ -1039,14 +1071,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.applyCh = applyCh
-	rf.applyCond = *sync.NewCond(&rf.applyMu)
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.state = Follower
-	rf.voteFor = -1
+	rf.State = Follower
+	rf.VoteFor = -1
 	rf.commitIndex = -1
 	rf.lastApplied = -1
+	rf.applyCh = applyCh
+	rf.applyCond = *sync.NewCond(&rf.applyMu)
 	rf.setLastContact(time.Time{})
 
 	// initialize from state persisted before a crash
