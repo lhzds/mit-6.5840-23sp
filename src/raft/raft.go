@@ -342,9 +342,15 @@ func (rf *Raft) nextTermAndState(newState RaftState, newTerm int, holdLock bool)
 	default:
 		if rf.CurrentTerm != newTerm {
 			Debug(dTerm, "[S%v's Term: %v -> %v] S%v's term changed", rf.me, rf.CurrentTerm, newTerm, rf.me)
+			rf.CurrentTerm = newTerm
+			rf.VoteFor = -1
 		}
-		rf.CurrentTerm = newTerm
-		rf.VoteFor = -1
+	}
+
+	if newTerm != 0 {
+		rf.logMu.Lock()
+		rf.persist()
+		rf.logMu.Unlock()
 	}
 
 	if newState == rf.State {
@@ -424,7 +430,7 @@ func (rf *Raft) readPersist(data []byte) {
 	)
 	if d.Decode(&CurrentTerm) != nil ||
 		d.Decode(&VoteFor) != nil || d.Decode(&Log) != nil {
-		Debug(dPersist, "s%v fail to read persist state", rf.me)
+		Debug(dPersist, "S%v fail to read persist state", rf.me)
 		return
 	}
 
@@ -476,6 +482,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	// 判断是否为新一轮新的 term
 	if args.Term > rf.CurrentTerm {
+		// 进入新 Term，voteFor才需要进行更新
 		rf.nextTermAndState(Follower, args.Term, true)
 	}
 
@@ -628,7 +635,9 @@ SUCCESS:
 	} else {
 		Debug(dRepl, "[S%v -> S%v] S%v prepare to write new entries",
 			args.LeaderId, rf.me, rf.me)
+		rf.mu.Lock()
 		rf.writeLogEntries(args.PrevLogIndex+1, args.Entries...)
+		rf.mu.Unlock()
 	}
 
 	// 进行提交
@@ -912,7 +921,8 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 	rf.mu.Lock()
 	currentTerm := rf.CurrentTerm
 	rf.mu.Unlock()
-	for replState.nextIndex <= lastIndex {
+	prevSuccess := false
+	for !rf.killed() && replState.nextIndex <= lastIndex {
 		replState.mu.Lock()
 		if replState.shouldStop {
 			replState.mu.Unlock()
@@ -933,8 +943,13 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
-			Entries:      rf.getLogEntries(replState.nextIndex, replState.nextIndex+1),
 		}
+		if prevSuccess {
+			args.Entries = rf.getLogEntries(replState.nextIndex, lastIndex+1)
+		} else {
+			args.Entries = rf.getLogEntries(replState.nextIndex, replState.nextIndex+1)
+		}
+
 		reply := AppendEntriesReply{}
 
 		// 失败 nextIndex 没有更新，下一轮重新尝试
@@ -953,12 +968,13 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 		}
 		rf.mu.Unlock()
 
+		prevSuccess = reply.Success
 		// 复制成功，尝试进行提交
 		if reply.Success {
 			Debug(dRepl,
 				"[S%v <- S%v] S%v receive a agreed repl response",
 				rf.me, replState.server, rf.me)
-			new := commitment.match(replState.server, replState.nextIndex)
+			new := commitment.match(replState.server, replState.nextIndex+len(args.Entries)-1)
 			old := rf.getCommitIndex()
 			if new > old {
 				Debug(dCommit, "[S%v's CommitIndex: %v -> %v] S%v commit new entries",
@@ -967,7 +983,7 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 				rf.notifyApply()
 			}
 
-			replState.nextIndex++
+			replState.nextIndex += len(args.Entries)
 			continue
 		}
 
@@ -1030,16 +1046,17 @@ func (rf *Raft) notifyApply() {
 }
 
 func (rf *Raft) applyOneRound() {
-	for rf.lastApplied < rf.getCommitIndex() {
-		command := rf.getLogEntries(rf.lastApplied+1, rf.lastApplied+2)[0].Cmd
+	for !rf.killed() && rf.lastApplied < rf.getCommitIndex() {
+		entry := rf.getLogEntries(rf.lastApplied+1, rf.lastApplied+2)[0]
 		applyMsg := ApplyMsg{
 			CommandValid: true,
 			CommandIndex: rf.lastApplied + 2, // 上层应用下标从 1 开始，因此要比实际加一
-			Command:      command,
+			Command:      entry.Cmd,
 		}
+		Debug(dCommit, "S%v try to apply log[%v](term: %v)", rf.me, rf.lastApplied,
+			entry.Term)
 		rf.applyCh <- applyMsg
 		rf.lastApplied++
-		Debug(dCommit, "S%v try to apply log[%v]", rf.me, rf.lastApplied)
 	}
 }
 
