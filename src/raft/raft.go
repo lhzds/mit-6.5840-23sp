@@ -321,15 +321,10 @@ func (rf *Raft) stepDown() {
 	rf.setRepls(nil)
 }
 
-// 更新 Term 以及状态
+// 更新 Term 以及状态，调用前需先持有锁
 // (注：term == -1 表示 rf.currentTerm 自增 1，term == 0 表示 currentTerm 不变，
 // 否则更新为对应的 term)
-func (rf *Raft) nextTermAndState(newState RaftState, newTerm int, holdLock bool) {
-	if !holdLock {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-	}
-
+func (rf *Raft) nextTermAndState(newState RaftState, newTerm int) {
 	// term 增加
 	switch newTerm {
 	case -1:
@@ -430,7 +425,6 @@ func (rf *Raft) readPersist(data []byte) {
 	)
 	if d.Decode(&CurrentTerm) != nil ||
 		d.Decode(&VoteFor) != nil || d.Decode(&Log) != nil {
-		Debug(dPersist, "S%v fail to read persist state", rf.me)
 		return
 	}
 
@@ -483,7 +477,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 判断是否为新一轮新的 term
 	if args.Term > rf.CurrentTerm {
 		// 进入新 Term，voteFor才需要进行更新
-		rf.nextTermAndState(Follower, args.Term, true)
+		rf.nextTermAndState(Follower, args.Term)
 	}
 
 	// term 已经可以确认下来
@@ -578,7 +572,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 说明存在一个 term 大于等于自己的 Leader，当前节点必须为 Follower
 	if args.LeaderId != rf.me {
-		rf.nextTermAndState(Follower, args.Term, true)
+		rf.nextTermAndState(Follower, args.Term)
 	}
 
 	reply.Term = rf.CurrentTerm
@@ -755,7 +749,7 @@ func (rf *Raft) startElection(currentTerm int) {
 				return
 			}
 			if reply.Term > rf.CurrentTerm { // 说明当前节点过期了
-				rf.nextTermAndState(Follower, reply.Term, true)
+				rf.nextTermAndState(Follower, reply.Term)
 				return
 			}
 
@@ -764,7 +758,7 @@ func (rf *Raft) startElection(currentTerm int) {
 				rf.addGrantedVotes(1)
 				if int(rf.getGrantedVotes()) >= rf.quorumSize() { // 获得大半选票，当选 Leader
 					Debug(dVote, "S%v receives votes from majority of servers", rf.me)
-					rf.nextTermAndState(Leader, 0, true)
+					rf.nextTermAndState(Leader, 0)
 					return
 				}
 			}
@@ -789,7 +783,7 @@ func (rf *Raft) followerTicker() {
 			Debug(dTimer, "S%v time out(%v pass since the last cantact), start election",
 				rf.me, elapsed)
 
-			rf.nextTermAndState(Candidate, -1, true)
+			rf.nextTermAndState(Candidate, -1)
 			currentTerm := rf.CurrentTerm
 			rf.mu.Unlock()
 			rf.startElection(currentTerm)
@@ -814,7 +808,7 @@ func (rf *Raft) candidateTicker() {
 
 		//发起一轮新的选举
 		Debug(dTimer, "S%v time out, start a new election", rf.me)
-		rf.nextTermAndState(Candidate, -1, true)
+		rf.nextTermAndState(Candidate, -1)
 		currentTerm := rf.CurrentTerm
 		rf.mu.Unlock()
 
@@ -850,7 +844,7 @@ func (rf *Raft) heartbeat(currentTerm int) {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if reply.Term > rf.CurrentTerm {
-				rf.nextTermAndState(Follower, reply.Term, true)
+				rf.nextTermAndState(Follower, reply.Term)
 			}
 		}()
 	}
@@ -962,7 +956,7 @@ func (rf *Raft) replOneRound(replState *FollowerRepl, commitment *Commitment) {
 		// 如果过期则直接结束复制
 		rf.mu.Lock()
 		if rf.State != Leader || rf.CurrentTerm < reply.Term {
-			rf.nextTermAndState(Follower, reply.Term, true)
+			rf.nextTermAndState(Follower, reply.Term)
 			rf.mu.Unlock()
 			break
 		}
